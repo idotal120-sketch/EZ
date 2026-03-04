@@ -2,3 +2,4 @@ dist/*.exe
 build/**/*.pkg
 dist/
 build/
+build/AutoLang/*.pkg
