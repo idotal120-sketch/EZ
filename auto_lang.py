@@ -347,7 +347,8 @@ def _dbg(msg: str):
     global _debug_log_file
     try:
         if _debug_log_file is None:
-            _debug_log_file = open(_DEBUG_LOG_PATH, 'w', encoding='utf-8', buffering=1)
+            # Append so שנשמור היסטוריית דיבוג בין ריצות.
+            _debug_log_file = open(_DEBUG_LOG_PATH, 'a', encoding='utf-8', buffering=1)
         _debug_log_file.write(msg + '\n')
         _debug_log_file.flush()
     except Exception:
@@ -1766,6 +1767,16 @@ def _decide_word(original: str, boundary: str):
                 return
 
     lw = original.lower()
+
+    # Special case: English word followed by a comma.
+    # If the user typed a valid English word and then a comma, do not flip it
+    # into a different (also valid) native word. This still allows correction
+    # for gibberish like \"tct\" (which is not _nlp_valid in English).
+    if boundary == ',' and not typed_is_native:
+        if _is_pure_alpha(original) and _nlp_valid(original, 'en'):
+            if DEBUG:
+                print(f'Skip correction for EN word with comma: {original!r}')
+            return
 
     # Skip excluded words
     if EXCLUDE_WORDS and lw in EXCLUDE_WORDS:

@@ -71,83 +71,7 @@ def _apply_dark_title_bar(widget: QWidget):
 # ----------------------------
 # Configuration file path
 # ----------------------------
-CONFIG_FILE = os.path.expanduser('~/.auto_lang2_config.json')
-
-DEFAULT_CONFIG = {
-    'app_defaults': {
-        'whatsapp.exe': 'he',
-        'whatsapp.root.exe': 'he',
-        'telegram.exe': 'he',
-        'winword.exe': 'he',
-        'teams.exe': 'he',
-        'ms-teams.exe': 'he',
-        'code.exe': 'en',
-        'pycharm64.exe': 'en',
-        'windowsterminal.exe': 'en',
-        'powershell.exe': 'en',
-        'cmd.exe': 'en',
-        'slack.exe': 'en',
-        'excel.exe': 'en',
-        'outlook.exe': 'en',
-    },
-    'chat_defaults': {
-        'whatsapp.exe': {},
-        'ms-teams.exe': {},
-        'teams.exe': {},
-    },
-    'watch_title_exes': [
-        'chrome.exe',
-        'msedge.exe',
-        'outlook.exe',
-        'olk.exe',
-    ],
-    'browser_defaults': {},
-    'exclude_words': [],
-    'enabled': True,
-    'debug': False,
-    'auto_switch': True,
-    'auto_switch_count': 2,
-    'hide_scores': False,
-    'show_typing_panel': False,
-    'privacy_guard': True,
-    'privacy_blocked_exes': [
-        '1password.exe', 'keeper.exe', 'keepass.exe', 'keepassxc.exe',
-        'lastpass.exe', 'bitwarden.exe', 'dashlane.exe', 'roboform.exe',
-        'enpass.exe', 'mstsc.exe', 'vmconnect.exe', 'vmware-vmx.exe',
-        'virtualbox.exe', 'anydesk.exe', 'teamviewer.exe',
-    ],
-    # Spell check
-    'spell_enabled': True,
-    'spell_mode': 'tooltip',       # 'tooltip' | 'auto' | 'visual'
-    # Grammar / LLM
-    'grammar_enabled': False,
-    'grammar_provider': 'openai',  # 'openai' | 'anthropic' | 'gemini'
-    'grammar_api_key': '',
-    'grammar_model': '',           # empty → use provider default
-}
-
-
-def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
-            config = DEFAULT_CONFIG.copy()
-            for key in DEFAULT_CONFIG:
-                if key in saved:
-                    config[key] = saved[key]
-            return config
-        except Exception:
-            pass
-    return DEFAULT_CONFIG.copy()
-
-
-def save_config(config: dict) -> None:
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f'Failed to save config: {e}')
+from autolang_config import load_config, save_config
 
 
 # ----------------------------
@@ -3855,13 +3779,14 @@ class AutoLangTray:
 
     def _start_engine(self):
         try:
+            _ui_log('[ENGINE] starting engine thread...')
             import auto_lang
             self._apply_config_to_engine(auto_lang, self.config)
             auto_lang.main()
         except Exception as e:
-            print(f'Engine start failed: {e}')
             import traceback
-            traceback.print_exc()
+            _ui_log(f'[ENGINE] start failed: {e!r}')
+            _ui_log(traceback.format_exc())
 
     def run(self):
         self.app = QApplication.instance() or QApplication(sys.argv)
