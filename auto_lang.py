@@ -45,6 +45,7 @@ import grammar_module
 from keyboard_maps import (
     ALL_PROFILES, ENGLISH_LANG_IDS, LanguageProfile,
     lang_id_to_profile, is_english_lang_id, detect_script,
+    HE_WORD_TO_EN, EN_WORD_TO_HE,
 )
 
 
@@ -128,8 +129,9 @@ CORRECTION_EXCLUDED_EXE: set[str] = {
 
 PRIVACY_GUARD_ENABLED = True
 
-# Apps fully blocked — password managers, banking, RDP, VM consoles
-PRIVACY_BLOCKED_EXE: set[str] = {
+# Apps fully blocked — password managers, banking, RDP, VM consoles.
+# Merged at runtime with config['privacy_blocked_exes'] (user-added "no correction" apps).
+BUILTIN_PRIVACY_BLOCKED_EXE: set[str] = {
     # Password managers
     '1password.exe', 'keeper.exe', 'keepass.exe', 'keepassxc.exe',
     'lastpass.exe', 'bitwarden.exe', 'dashlane.exe', 'roboform.exe',
@@ -142,6 +144,7 @@ PRIVACY_BLOCKED_EXE: set[str] = {
     # Remote desktop tools
     'anydesk.exe', 'teamviewer.exe',
 }
+PRIVACY_BLOCKED_EXE: set[str] = set(BUILTIN_PRIVACY_BLOCKED_EXE)
 
 import re as _re
 
@@ -322,6 +325,25 @@ def _push_prev_word(word: str):
         _prev_words = (_prev_words + [word])[-30:]
 
 
+def _is_english_corrected(text: str) -> bool:
+    """True if text looks like an English word/phrase (ASCII letters)."""
+    if not text or not text.strip():
+        return False
+    return all(c.isascii() or not c.isalpha() for c in text.strip())
+
+
+def _capitalize_corrected_for_sentence(corrected: str, is_first_english_in_sentence: bool) -> str:
+    """If first word replaced to English in this sentence: first letter capital, or title case for names (multi-word)."""
+    if not is_first_english_in_sentence or not corrected or not corrected.strip():
+        return corrected
+    raw = corrected.strip()
+    if not _is_english_corrected(raw):
+        return corrected
+    if ' ' in raw:
+        return raw.title()
+    return raw[0].upper() + raw[1:].lower() if len(raw) > 1 else raw.upper()
+
+
 def _record_word_correction(original: str, corrected: str):
     """Record that 'original' was corrected to 'corrected'.
     Also update _prev_words so the panel shows the corrected text."""
@@ -339,6 +361,24 @@ def _record_word_correction(original: str, corrected: str):
 # Direct file-based debug log (bypasses stdout buffering issues)
 _DEBUG_LOG_PATH = os.path.join(os.path.expanduser('~'), 'auto_lang3_debug.log')
 _debug_log_file = None
+
+# Correction log — always written, for debugging wrong replacements (e.g. אוהב -> tuvc vs love)
+_CORRECTION_LOG_PATH = os.path.join(os.path.expanduser('~'), 'auto_lang3_correction.log')
+
+
+def _log_correction(original: str, corrected: str, boundary: str, kind: str = 'single'):
+    """Append one line to correction log (always on, not gated by DEBUG)."""
+    try:
+        write_header = not os.path.isfile(_CORRECTION_LOG_PATH) or os.path.getsize(_CORRECTION_LOG_PATH) == 0
+        with open(_CORRECTION_LOG_PATH, 'a', encoding='utf-8') as f:
+            if write_header:
+                f.write("# timestamp\tkind\tlen_orig\tlen_corr\toriginal\t->\tcorrected\tboundary\n")
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            line = f"{ts}\t{kind}\t{len(original)}\t{len(corrected)}\t{original!r}\t->\t{corrected!r}\tboundary={boundary!r}\n"
+            f.write(line)
+    except Exception:
+        pass
+
 
 def _dbg(msg: str):
     """Write debug message to file — only when DEBUG is enabled."""
@@ -453,6 +493,7 @@ KEYEVENTF_UNICODE = 0x0004
 VK_BACK = 0x08
 VK_SPACE = 0x20
 VK_SHIFT = 0x10
+VK_CAPITAL = 0x14   # Caps Lock
 VK_CONTROL = 0x11
 VK_MENU = 0x12    # Alt
 VK_LWIN = 0x5B
@@ -547,6 +588,17 @@ _ENUM_CHILD_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPA
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║ Low-level helpers                                            ║
 # ╚═══════════════════════════════════════════════════════════════╝
+
+def _get_shift_caps_state() -> tuple[bool, bool]:
+    """Return (shift_pressed, caps_lock_on) using GetKeyState (reliable in hook context)."""
+    try:
+        # High bit = key is down; for VK_CAPITAL low bit = toggle state
+        shift = (user32.GetKeyState(VK_SHIFT) & 0x8000) != 0
+        caps = (user32.GetKeyState(VK_CAPITAL) & 1) != 0
+        return (shift, caps)
+    except Exception:
+        return (False, False)
+
 
 def _send_vk(vk: int) -> None:
     """Press and release a single virtual key (with proper scan code)."""
@@ -990,6 +1042,24 @@ def _translate(text: str, mapping: dict[str, str]) -> str:
     return ''.join(mapping.get(c, c) for c in text)
 
 
+def _to_english_word(original: str, native_lang: str, to_en: dict[str, str]) -> str:
+    """Hebrew/other -> English: use word meaning (HE_WORD_TO_EN) when available, else key mapping."""
+    if native_lang == 'he':
+        w = original.strip()
+        if w in HE_WORD_TO_EN:
+            return HE_WORD_TO_EN[w]
+    return _translate(original, to_en)
+
+
+def _to_hebrew_word(original: str, from_en: dict[str, str], lang_code: str = 'he') -> str:
+    """English -> Hebrew: use intended word (EN_WORD_TO_HE) when available, else key mapping."""
+    if lang_code == 'he':
+        w = original.strip().lower()
+        if w in EN_WORD_TO_HE:
+            return EN_WORD_TO_HE[w]
+    return _translate(original, from_en)
+
+
 def _nlp_valid(word: str, lang: str) -> bool:
     """Check if word is a real word in the given language using wordfreq."""
     if not word or len(word) < 2:
@@ -1072,7 +1142,7 @@ def _nlp_decide_for_lock(original: str, locked_lang: str) -> str | None:
         en_score = zipf_frequency(en_word, 'en') if _is_pure_alpha(en_word) else 0.0
         for lang_code in ACTIVE_PROFILES:
             from_en = PROFILE_FROM_EN.get(lang_code, {})
-            native_version = _translate(original, from_en)
+            native_version = _to_hebrew_word(original, from_en, lang_code)
             if native_version and native_version != original:
                 nw = native_version.strip().lower()
                 # Structural: must start with correct script
@@ -1090,7 +1160,7 @@ def _nlp_decide_for_lock(original: str, locked_lang: str) -> str | None:
     else:
         # Word is native chars — check if English translation scores higher
         to_en = PROFILE_TO_EN.get(locked_lang, {})
-        en_version = _translate(original, to_en)
+        en_version = _to_english_word(original, locked_lang, to_en)
         if en_version and en_version != original:
             en_word = en_version.strip().lower()
             # Structural: English must be pure alpha letters
@@ -1219,7 +1289,7 @@ def _compute_word_scores(word: str) -> dict:
         flag = profile.flag
         if is_en_chars:
             from_en = PROFILE_FROM_EN.get(lang_code, {})
-            native_version = _translate(word, from_en)
+            native_version = _to_hebrew_word(word, from_en, lang_code)
         else:
             native_version = word
         nw = native_version.strip().lower()
@@ -1328,6 +1398,7 @@ class EngineState:
         self.sentence_lang: str | None = None      # Language locked for this sentence
         self.words_in_sentence = 0                  # Word count in current sentence
         self.confirmed_words = 0                    # Words confirmed in current language
+        self.first_english_correction_done = False  # Capitalize first word replaced to English per sentence
 
         # Pending ambiguous words
         # Each: {'original': str, 'en_version': str, 'native_version': str,
@@ -1351,6 +1422,7 @@ class EngineState:
         self.sentence_lang = None
         self.words_in_sentence = 0
         self.confirmed_words = 0
+        self.first_english_correction_done = False
         self.pending = []
 
     def reset_all(self):
@@ -1483,7 +1555,14 @@ def _pick_default_lang(exe: str, title: str) -> str | None:
     if direct and (direct == 'en' or direct in ACTIVE_PROFILES):
         return direct
 
-    return None
+    # 4) Fallback: infer from title/URL — Hebrew letters → he, else en
+    text = (title or '') + (exe or '')
+    for ch in text:
+        if '\u0590' <= ch <= '\u05FF' or '\u0600' <= ch <= '\u06FF':
+            if 'he' in ACTIVE_PROFILES:
+                return 'he'
+            break
+    return 'en' if 'en' in ACTIVE_PROFILES else None
 
 
 def _app_default_watcher():
@@ -1643,6 +1722,7 @@ def _replace_text(original: str, corrected: str, boundary: str):
         # Track per-word correction for click-to-revert
         _record_word_correction(original, corrected)
         _fire_buffer_callback()
+        _log_correction(original, corrected, boundary, 'single')
     except Exception as e:
         _log_error(f'_replace_text failed: {e}')
     finally:
@@ -1698,6 +1778,8 @@ def _replace_batch(winner_lang: str, pending: list[dict],
 
         # Use direct Unicode injection (no clipboard contamination)
         _dbg(f'BATCH: injecting replacement={replacement!r}')
+        for w in all_words:
+            _log_correction(w['original'], w['corrected'], w['boundary'], 'batch')
         _send_unicode_text(replacement)
         _dbg(f'BATCH: done injecting')
 
@@ -1743,7 +1825,7 @@ def _decide_word(original: str, boundary: str):
         native_version = original
         native_lang = typed_lang
         to_en = PROFILE_TO_EN.get(typed_lang, {})
-        en_version = _translate(original, to_en)
+        en_version = _to_english_word(original, typed_lang, to_en)
         typed_is_native = True
     else:
         en_version = original
@@ -1753,7 +1835,7 @@ def _decide_word(original: str, boundary: str):
         native_lang = None
         for lang_code in ACTIVE_PROFILES:
             from_en = PROFILE_FROM_EN.get(lang_code, {})
-            candidate = _translate(original, from_en)
+            candidate = _to_hebrew_word(original, from_en, lang_code)
             if candidate != original:
                 native_version = candidate
                 native_lang = lang_code
@@ -1762,7 +1844,7 @@ def _decide_word(original: str, boundary: str):
             if len(ACTIVE_PROFILES) == 1:
                 native_lang = next(iter(ACTIVE_PROFILES))
                 from_en = PROFILE_FROM_EN.get(native_lang, {})
-                native_version = _translate(original, from_en)
+                native_version = _to_hebrew_word(original, from_en, native_lang)
             else:
                 return
 
@@ -1861,6 +1943,13 @@ def _handle_winner(winner: str, original: str, en_version: str, native_version: 
         # Batch correct pending + current
         pending_copy = list(state.pending)
         state.pending = []
+        # Pending items have en_version/native_version, not 'corrected' — add it from winner
+        for i, pw in enumerate(pending_copy):
+            if winner == 'en':
+                corr = pw['en_version'] if pw['typed_is_native'] else pw['original']
+            else:
+                corr = pw['native_version'] if not pw['typed_is_native'] else pw['original']
+            pending_copy[i] = {**pw, 'corrected': corr}
 
         # Count all confirmed words (pending + current)
         state.confirmed_words += len(pending_copy) + 1
@@ -1870,6 +1959,19 @@ def _handle_winner(winner: str, original: str, en_version: str, native_version: 
             current_entry = {'original': original, 'corrected': corrected, 'boundary': boundary}
         else:
             current_entry = {'original': original, 'corrected': original, 'boundary': boundary}
+
+        # First word replaced to English in sentence: capitalize (first in order that is English)
+        if not state.first_english_correction_done:
+            combined = pending_copy + [current_entry]
+            for i, w in enumerate(combined):
+                if _is_english_corrected(w['corrected']):
+                    combined[i] = {**w, 'corrected': _capitalize_corrected_for_sentence(w['corrected'], True)}
+                    state.first_english_correction_done = True
+                    if i < len(pending_copy):
+                        pending_copy[i] = combined[i]
+                    else:
+                        current_entry = combined[i]
+                    break
 
         # Pre-check: does ANY word actually need correction?
         # This avoids setting injecting (which blocks user input) when nothing changes.
@@ -1897,6 +1999,10 @@ def _handle_winner(winner: str, original: str, en_version: str, native_version: 
                 print(f'Batch: no correction needed for {len(pending_copy)+1} words')
     elif needs_correction:
         state.confirmed_words += 1
+        is_first_english = _is_english_corrected(corrected) and not state.first_english_correction_done
+        if is_first_english:
+            state.first_english_correction_done = True
+        corrected = _capitalize_corrected_for_sentence(corrected, is_first_english)
         _spawn_single(original, corrected, boundary, winner)
     else:
         state.confirmed_words += 1  # correct language, still counts
@@ -1946,6 +2052,19 @@ def _maybe_flush_pending():
 
     pending_copy = list(state.pending)
     state.pending = []
+    # Pending items have en_version/native_version, not 'corrected' — compute it from best
+    for i, pw in enumerate(pending_copy):
+        if best == 'en':
+            corr = pw['en_version'] if pw['typed_is_native'] else pw['original']
+        else:
+            corr = pw['native_version'] if not pw['typed_is_native'] else pw['original']
+        pending_copy[i] = {**pw, 'corrected': corr}
+    if not state.first_english_correction_done:
+        for i, w in enumerate(pending_copy):
+            if _is_english_corrected(w['corrected']):
+                pending_copy[i] = {**w, 'corrected': _capitalize_corrected_for_sentence(w['corrected'], True)}
+                state.first_english_correction_done = True
+                break
     injecting.set()  # Set BEFORE spawning thread
 
     if DEBUG:
@@ -2170,11 +2289,11 @@ def _process_boundary(boundary: str):
 
             if state.sentence_lang == 'en' and typed_is_native:
                 to_en = PROFILE_TO_EN.get(typed_lang, {})
-                corrected = _translate(original, to_en)
+                corrected = _to_english_word(original, typed_lang, to_en)
                 wrong = True
             elif state.sentence_lang != 'en' and not typed_is_native:
                 from_en = PROFILE_FROM_EN.get(state.sentence_lang, {})
-                corrected = _translate(original, from_en)
+                corrected = _to_hebrew_word(original, from_en, state.sentence_lang)
                 wrong = True
 
             if wrong:
@@ -2220,6 +2339,10 @@ def _process_boundary(boundary: str):
                     _dbg(f'[LOCK-WRONG-SKIP] keeping {original!r} — NLP says correction is worse')
                     return
 
+                is_first_english = _is_english_corrected(corrected) and not state.first_english_correction_done
+                if is_first_english:
+                    state.first_english_correction_done = True
+                corrected = _capitalize_corrected_for_sentence(corrected, is_first_english)
                 if DEBUG:
                     print(f'Sentence-lock: {original!r} -> {corrected!r}')
                 _spawn_single(original, corrected, boundary, state.sentence_lang)
@@ -2237,15 +2360,18 @@ def _process_boundary(boundary: str):
                 # Translate the word to the winner language
                 if nlp_winner == 'en':
                     to_en = PROFILE_TO_EN.get(state.sentence_lang, {})
-                    corrected = _translate(original, to_en)
+                    corrected = _to_english_word(original, state.sentence_lang, to_en)
                 else:
                     from_en = PROFILE_FROM_EN.get(nlp_winner, {})
-                    corrected = _translate(original, from_en)
+                    corrected = _to_hebrew_word(original, from_en, nlp_winner)
+                is_first_english = _is_english_corrected(corrected) and not state.first_english_correction_done
+                if is_first_english:
+                    state.first_english_correction_done = True
+                corrected = _capitalize_corrected_for_sentence(corrected, is_first_english)
                 # Correct this one word, but don't touch sentence_lang
                 _spawn_single(original, corrected, boundary, nlp_winner)
                 return
-            else:
-                return
+            return
 
         # Run NLP decision
         _decide_word(original, boundary)
@@ -2464,11 +2590,7 @@ def _on_key(event: keyboard.KeyboardEvent):
             if not is_english_lang_id(_lid):
                 # If Shift is held, user wants the shifted English char
                 # (e.g. Shift+ף → ':'), NOT the Hebrew letter
-                _shift_held = False
-                try:
-                    _shift_held = keyboard.is_pressed('shift')
-                except Exception:
-                    pass
+                _shift_held = _get_shift_caps_state()[0]
                 if not _shift_held:
                     _actual = _scan_to_actual_char(event.scan_code, _lid)
                     if _actual and _actual.isalpha():
@@ -2480,11 +2602,7 @@ def _on_key(event: keyboard.KeyboardEvent):
                 # Check if this punctuation maps to a letter in any active profile
                 _en_key = _scan_to_english_char(event.scan_code)
                 if _en_key and ACTIVE_PROFILES:
-                    _shift_held = False
-                    try:
-                        _shift_held = keyboard.is_pressed('shift')
-                    except Exception:
-                        pass
+                    _shift_held = _get_shift_caps_state()[0]
                     if not _shift_held:
                         for _pcode, _pfrom in PROFILE_FROM_EN.items():
                             _mapped = _pfrom.get(_en_key)
@@ -2563,11 +2681,7 @@ def _on_key(event: keyboard.KeyboardEvent):
         # Shift + OEM key in non-English layout: use shifted English char
         # (e.g. Shift+ת → '<', Shift+ץ → '>')  instead of Hebrew letter
         if not is_english_lang_id(lang_id):
-            _shift_held = False
-            try:
-                _shift_held = keyboard.is_pressed('shift')
-            except Exception:
-                pass
+            _shift_held = _get_shift_caps_state()[0]
             if _shift_held:
                 _en_base = _scan_to_english_char(event.scan_code)
                 _shifted = SHIFT_EN_CHARS.get(_en_base)
@@ -2590,7 +2704,20 @@ def _on_key(event: keyboard.KeyboardEvent):
         if not ch:
             return
         en_char = _scan_to_english_char(event.scan_code)
-        _dbg(f'[CHAR] scan={event.scan_code} en={en_char!r} actual={ch!r} lang=0x{lang_id:04x}')
+        shift_pressed, caps_on = _get_shift_caps_state()
+        # Apply Shift/Caps Lock so buffer reflects what the user actually types
+        if ch and en_char:
+            if en_char.isalpha():
+                if ch.isascii() and ch.isalpha():
+                    # Latin letter: uppercase when Shift XOR Caps Lock
+                    ch = ch.upper() if (shift_pressed != caps_on) else ch.lower()
+                elif not is_english_lang_id(lang_id) and shift_pressed:
+                    # Non-English layout + Shift: often produces Latin letter (e.g. Hebrew layout)
+                    ch = en_char.upper() if caps_on else en_char.lower()
+            elif is_english_lang_id(lang_id) and (en_char in SHIFT_EN_CHARS) and shift_pressed:
+                # Digit/symbol: use shifted form (e.g. '1' → '!')
+                ch = SHIFT_EN_CHARS.get(en_char, ch)
+        _dbg(f'[CHAR] scan={event.scan_code} en={en_char!r} actual={ch!r} lang=0x{lang_id:04x} shift={shift_pressed} caps={caps_on}')
 
         with state.lock:
             state.buffer += ch
@@ -2817,6 +2944,7 @@ def _load_ui_config():
     """Load config from UI config file."""
     global DEBUG, EXCLUDE_WORDS, AUTO_SWITCH_LAYOUT, AUTO_SWITCH_AFTER_CONSECUTIVE
     global APP_DEFAULT_LANG_BY_EXE, APP_DEFAULT_LANG_BY_TITLE, ENGINE_ENABLED
+    global PRIVACY_BLOCKED_EXE
 
     config_path = os.path.expanduser('~/.auto_lang2_config.json')
     if not os.path.exists(config_path):
@@ -2850,6 +2978,11 @@ def _load_ui_config():
 
         if 'exclude_words' in cfg:
             EXCLUDE_WORDS = set(w.lower() for w in cfg['exclude_words'])
+
+        if 'privacy_blocked_exes' in cfg:
+            PRIVACY_BLOCKED_EXE = BUILTIN_PRIVACY_BLOCKED_EXE | set(
+                exe.lower() for exe in cfg['privacy_blocked_exes'] if exe
+            )
 
         if 'enabled' in cfg:
             ENGINE_ENABLED = cfg['enabled']

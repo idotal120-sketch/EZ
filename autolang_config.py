@@ -62,6 +62,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Spell check
     'spell_enabled': True,
     'spell_mode': 'tooltip',       # 'tooltip' | 'auto' | 'visual'
+    # Speech-to-text (Whisper)
+    'speech_enabled': False,
     # Grammar / LLM
     'grammar_enabled': False,
     'grammar_provider': 'openai',  # 'openai' | 'anthropic' | 'gemini'

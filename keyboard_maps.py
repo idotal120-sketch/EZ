@@ -63,6 +63,25 @@ _EN_TO_HE = {v: k for k, v in _HE_TO_EN.items()}
 # Add uppercase English -> same Hebrew (Hebrew has no uppercase)
 _EN_TO_HE.update({v.upper(): k for k, v in _HE_TO_EN.items() if v.isalpha()})
 
+# Common Hebrew words -> English (for correction: use meaning instead of key mapping)
+HE_WORD_TO_EN: Dict[str, str] = {
+    'אוהב': 'love', 'אוהבת': 'love', 'שלום': 'hello', 'תודה': 'thanks', 'בבקשה': 'please',
+    'כן': 'yes', 'לא': 'no', 'טוב': 'good', 'יפה': 'nice', 'אני': 'I', 'אתה': 'you',
+    'הוא': 'he', 'היא': 'she', 'זה': 'this', 'זאת': 'this', 'מה': 'what', 'איך': 'how',
+    'למה': 'why', 'איפה': 'where', 'מתי': 'when', 'אם': 'if', 'גם': 'also', 'רק': 'only',
+    'עוד': 'more', 'כבר': 'already', 'עכשיו': 'now', 'פה': 'here', 'שם': 'there',
+    'היום': 'today', 'מחר': 'tomorrow', 'אתמול': 'yesterday', 'אחד': 'one', 'שתיים': 'two',
+    'בננה': 'banana', 'בננות': 'bananas', 'לאכול': 'eat', 'לשתות': 'drink', 'מים': 'water',
+    'לחם': 'bread', 'חלב': 'milk', 'תפוח': 'apple', 'תפוחים': 'apples',
+}
+
+# English key sequences that mean a Hebrew word (wrong layout) -> correct Hebrew.
+EN_WORD_TO_HE: Dict[str, str] = {
+    'vrcv': 'הרבה',
+    'hu,r': 'הרבה',
+    'hfr': 'הרבה',
+}
+
 _HE_SHORT_WORDS = {
     # Common 1-2 letter Hebrew words typed with English layout
     'tk': 'את',

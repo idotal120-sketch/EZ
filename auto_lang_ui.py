@@ -103,11 +103,23 @@ def _lang_display(code: str) -> str:
     return code
 
 
+def _lang_name_only(code: str) -> str:
+    """Label in source language only (for panel buttons)."""
+    info = LANG_DISPLAY.get(code)
+    if info:
+        return info[0]
+    return code
+
+
 def _lang_code_from_display(display: str) -> str:
     for code, (name, flag) in LANG_DISPLAY.items():
         if f'{name} {flag}' == display or code == display:
             return code
     return display
+
+
+# Label for "no automatic correction" in app list (must match when reading combo)
+NO_CORRECTION_LABEL = '\u05dc\u05dc\u05d0 \u05ea\u05d9\u05e7\u05d5\u05df'  # ללא תיקון
 
 
 def _get_available_lang_codes() -> list:
@@ -120,6 +132,17 @@ def _get_available_lang_codes() -> list:
     except ImportError:
         pass
     return codes
+
+
+def _get_installed_lang_codes_for_panel() -> list:
+    """Only languages that are actually installed (in engine ACTIVE_PROFILES)."""
+    try:
+        import auto_lang
+        profiles = getattr(auto_lang, 'ACTIVE_PROFILES', {})
+        codes = ['en'] + [c for c in sorted(profiles.keys()) if c != 'en']
+        return codes if len(codes) > 1 else ['en', 'he']
+    except Exception:
+        return ['en', 'he']
 
 
 # ──────────────────────────────────────────────────────────
@@ -531,6 +554,13 @@ class FloatingWidget(QWidget):
         self._word_scores = {}
         self._line2_word_rects = []   # [(word_index, x_left, x_right, word_str), ...]
         self._scroll_x = 0   # manual horizontal scroll offset (pixels)
+        self._app_info = ''  # foreground app/title hint when no text
+        self._last_fg_exe = ''   # exe/title at last buffer update (for panel button actions)
+        self._last_fg_title = ''
+        self._panel_button_rects = []  # [(id, x, y, w, h), ...] for row-2 buttons when no text
+        self._panel_button_pressed_id = None  # brief highlight after click
+        self._panel_button_press_time = 0.0
+        self._relayout_keep_right = None  # when set, _relayout keeps this right edge
 
         # Editor
         self._edit_mode = False
@@ -600,9 +630,9 @@ class FloatingWidget(QWidget):
         self._tooltip_tag = ''
         self._tooltip_texts = {
             'q_top':    '\u05d4\u05e4\u05e2\u05dc / \u05d4\u05e9\u05d1\u05ea \u05ea\u05d9\u05e7\u05d5\u05df \u05e9\u05e4\u05d4',
-            'q_left':   '\u05d1\u05d8\u05dc \u05ea\u05d9\u05e7\u05d5\u05df \u05d0\u05d7\u05e8\u05d5\u05df',
+            'q_left':   '\u05e4\u05ea\u05d7 / \u05e1\u05d2\u05d5\u05e8 \u05ea\u05d9\u05d1\u05ea \u05d4\u05d4\u05e7\u05dc\u05d3\u05d4',
             'q_bottom': '\u05e4\u05ea\u05d7 \u05e2\u05d5\u05e8\u05da \u05ea\u05e8\u05d2\u05d5\u05dd',
-            'q_right':  '\u05d4\u05d2\u05d3\u05e8\u05d5\u05ea',
+            'q_right':  '\u05d1\u05d8\u05dc \u05ea\u05d9\u05e7\u05d5\u05df \u05d0\u05d7\u05e8\u05d5\u05df',
             'q_center': '\u05d4\u05e7\u05dc\u05d8\u05d4 \u05e7\u05d5\u05dc\u05d9\u05ea',
         }
 
@@ -653,12 +683,13 @@ class FloatingWidget(QWidget):
         except Exception:
             pass
 
-        # Preload Whisper model in background
-        try:
-            import speech_module
-            speech_module.preload_model()
-        except Exception:
-            pass
+        # Preload Whisper model in background (only if enabled in settings)
+        if self.tray and getattr(self.tray, 'config', {}).get('speech_enabled', True):
+            try:
+                import speech_module
+                speech_module.preload_model()
+            except Exception:
+                pass
 
         # Right-click translate hook
         self._start_right_click_hook()
@@ -778,9 +809,9 @@ class FloatingWidget(QWidget):
 
         quadrants = [
             (90,  'q_top',    q_toggle, '\u23fb', 0, -1),
-            (180, 'q_left',   q_base,   '\u21a9', -1, 0),
+            (180, 'q_left',   q_base,   '\u2328', -1, 0),  # keyboard icon: toggle typing box
             (270, 'q_bottom', q_base,   '\u270e', 0,  1),
-            (0,   'q_right',  q_base,   '\u2699', 1,  0),
+            (0,   'q_right',  q_base,   '\u21a9', 1,  0),  # undo
         ]
 
         icon_rect = QRect(cx - r, cy - r, 2 * r, 2 * r)
@@ -908,7 +939,7 @@ class FloatingWidget(QWidget):
         p.save()
         p.setClipRect(QRectF(margin, 0, available, self.WIDGET_SIZE))
 
-        # ── Line 1: actual text ──
+        # ── Line 1: actual text, or app + title when nothing typed ──
         font_normal = QFont('Segoe UI', 10)
         font_corrected = QFont('Segoe UI', 10)
         font_corrected.setUnderline(True)
@@ -917,7 +948,17 @@ class FloatingWidget(QWidget):
         shift1 = _auto_shift(total1) + self._scroll_x
         shift1 = max(0, min(shift1, max(0, total1 - available)))
 
-        if is_rtl:
+        if not words1 and self._app_info:
+            # No text typed — show app name + window title on top line (extra right margin so not hidden by border)
+            info = self._app_info
+            if len(info) > 50:
+                info = info[:47] + '...'
+            p.setFont(font_normal)
+            p.setPen(QColor(COLORS['text_secondary']))
+            sw = fm1.horizontalAdvance(info)
+            right_margin_line1 = 0
+            p.drawText(int(pw - right_margin_line1 - sw), y1, info)
+        elif is_rtl:
             x = pw - margin
             for word in words1:
                 is_corr = word in self._corrections
@@ -938,43 +979,81 @@ class FloatingWidget(QWidget):
                 p.drawText(int(draw_x), y1, word)
                 x += ww + gap
 
-        # ── Line 2: translated text (store rects for click-to-replace) ──
+        # ── Line 2: translated text OR action buttons (when no text typed) ──
         font2 = QFont('Segoe UI', 9)
         p.setFont(font2)
-        p.setPen(QColor(COLORS['translate']))
         fm2 = QFontMetrics(font2)
-        total2 = _total(words2, fm2)
-        shift2 = _auto_shift(total2) + self._scroll_x
-        shift2 = max(0, min(shift2, max(0, total2 - available)))
+        self._panel_button_rects = []
         rects = []
 
-        if is_rtl:
-            x = pw - margin
-            for i, word in enumerate(words2):
-                ww = fm2.horizontalAdvance(word)
-                draw_x = x - ww + shift2
-                p.drawText(int(draw_x), y2, word)
-                rects.append((i, int(draw_x), int(draw_x + ww), word))
-                x -= ww + gap
+        if not words1 and self._app_info:
+            # Label "בחר:" on the right, then buttons RTL
+            btn_y, btn_h = 26, 18
+            pad = 4
+            font_btn = QFont('Segoe UI', 8)
+            p.setFont(font_btn)
+            fm_btn = QFontMetrics(font_btn)
+            set_as_label = '\u05d1\u05d7\u05e8\u200f:'  # בחר + RLM + :
+            label_w = fm_btn.horizontalAdvance(set_as_label)
+            gap_after_label = 8
+            x_right = pw - margin - label_w - gap_after_label
+            p.setPen(QColor(COLORS['text_secondary']))
+            p.drawText(int(pw - margin - label_w), btn_y, int(label_w), btn_h, Qt.AlignRight | Qt.AlignVCenter, set_as_label)
+            # Brief highlight for recently pressed button
+            now = time.time()
+            if self._panel_button_pressed_id is not None and (now - self._panel_button_press_time) > 0.35:
+                self._panel_button_pressed_id = None
+            pressed_id = getattr(self, '_panel_button_pressed_id', None)
+            no_corr_label = '\u05dc\u05dc\u05d0 \u05ea\u05d9\u05e7\u05d5\u05df'  # ללא תיקון
+            labels = [('no_correction', no_corr_label)]
+            for code in _get_installed_lang_codes_for_panel():
+                labels.append((code, _lang_name_only(code)))
+            for bid, label in labels:
+                tw = fm_btn.horizontalAdvance(label) + pad * 2
+                x_left = x_right - tw
+                self._panel_button_rects.append((bid, int(x_left), btn_y, int(tw), btn_h))
+                is_pressed = (bid == pressed_id)
+                p.setPen(QPen(QColor(COLORS['accent'] if is_pressed else COLORS['border']), 1))
+                p.setBrush(QColor(COLORS['accent_dim'] if is_pressed else COLORS['bg_light']))
+                p.drawRoundedRect(x_left, btn_y, tw, btn_h, 3, 3)
+                p.setPen(QColor(COLORS['accent']))
+                p.drawText(int(x_left), btn_y, int(tw), btn_h, Qt.AlignCenter, label)
+                x_right = x_left - 6
+            self._line2_word_rects = rects
         else:
-            x = margin
-            for i, word in enumerate(words2):
-                ww = fm2.horizontalAdvance(word)
-                draw_x = x - shift2
-                p.drawText(int(draw_x), y2, word)
-                rects.append((i, int(draw_x), int(draw_x + ww), word))
-                x += ww + gap
-        self._line2_word_rects = rects
+            p.setPen(QColor(COLORS['translate']))
+            total2 = _total(words2, fm2)
+            shift2 = _auto_shift(total2) + self._scroll_x
+            shift2 = max(0, min(shift2, max(0, total2 - available)))
+            if is_rtl:
+                x = pw - margin
+                for i, word in enumerate(words2):
+                    ww = fm2.horizontalAdvance(word)
+                    draw_x = x - ww + shift2
+                    p.drawText(int(draw_x), y2, word)
+                    rects.append((i, int(draw_x), int(draw_x + ww), word))
+                    x -= ww + gap
+            else:
+                x = margin
+                for i, word in enumerate(words2):
+                    ww = fm2.horizontalAdvance(word)
+                    draw_x = x - shift2
+                    p.drawText(int(draw_x), y2, word)
+                    rects.append((i, int(draw_x), int(draw_x + ww), word))
+                    x += ww + gap
+            self._line2_word_rects = rects
 
         p.restore()  # remove clip
 
-        # ── Line 3: NLP scores (unchanged, always right-aligned, truncated) ──
-        if not self._hide_scores:
-            font_score = QFont('Segoe UI', 8)
-            p.setFont(font_score)
-            p.setPen(QColor('#8899aa'))
+        # ── Line 3: NLP scores OR app/title hint ───────────────────────
+        font_score = QFont('Segoe UI', 8)
+        p.setFont(font_score)
+        p.setPen(QColor('#8899aa'))
+
+        orig_words = self._cur_line1.split() if self._cur_line1.strip() else []
+
+        if orig_words and not self._hide_scores:
             score_parts = []
-            orig_words = self._cur_line1.split() if self._cur_line1.strip() else []
             for w in orig_words:
                 ws = self._word_scores.get(w)
                 if ws:
@@ -988,6 +1067,13 @@ class FloatingWidget(QWidget):
                 p.drawText(int(pw - margin - sw), y3, score_text)
 
     # ── hit testing ──────────────────────────────────────
+
+    def _hit_test_panel_button(self, click_x: int, click_y: int):
+        """If click is on a row-2 action button, return (lang_code or None for no_correction). Else None."""
+        for bid, bx, by, bw, bh in self._panel_button_rects:
+            if bx <= click_x <= bx + bw and by <= click_y <= by + bh:
+                return bid
+        return None
 
     def _hit_test_line2(self, click_x, click_y=None):
         """Check if click hits a word on line 2 (translated text).
@@ -1127,9 +1213,16 @@ class FloatingWidget(QWidget):
                     self._resize_drag_y = event.globalPosition().toPoint().y()
                     return
 
-            # Click on panel area — check for word click first, then toggle editor
+            # Click on panel area — buttons (when no text), word click, or toggle editor
             if self._panel_visible and x < self.PANEL_WIDTH and y < self.WIDGET_SIZE:
-                # Hit-test line 2 words on-the-fly (any click on panel)
+                if self._app_info and not (self._cur_line1.strip() or self._cur_line2.strip()):
+                    btn_id = self._hit_test_panel_button(x, y)
+                    if btn_id == 'no_correction':
+                        self._on_panel_no_correction_click()
+                        return
+                    if isinstance(btn_id, str) and btn_id != 'no_correction':
+                        self._on_panel_lang_click(btn_id)
+                        return
                 hit = self._hit_test_line2(x, y)
                 if hit is not None:
                     idx, word = hit
@@ -1145,10 +1238,13 @@ class FloatingWidget(QWidget):
             elif q == 'q_top':
                 self._toggle()
             elif q == 'q_left':
-                self._undo()
+                # Open/close the live typing panel (buffer view)
+                self._toggle_panel()
             elif q == 'q_right':
-                self._open_settings()
+                # Undo last correction
+                self._undo()
             elif q == 'q_bottom':
+                # Open/close the translation editor
                 self._toggle_edit_mode()
             else:
                 self._show_context_menu(event.globalPosition().toPoint())
@@ -1520,13 +1616,98 @@ class FloatingWidget(QWidget):
         self._corrections = corrections or {}
         self._word_scores = word_scores or {}
         self._scroll_x = 0   # auto-scroll to latest text
+
+        # When there is no text at all, show current app + window title
+        if not (self._cur_line1.strip() or self._cur_line2.strip()):
+            try:
+                import auto_lang
+                exe = getattr(auto_lang, '_get_foreground_exe', lambda: '')() or ''
+                title = getattr(auto_lang, '_get_foreground_title', lambda: '')() or ''
+            except Exception:
+                exe, title = '', ''
+
+            app_name = exe.rsplit('.', 1)[0] if exe else ''
+            parts = []
+            if app_name:
+                parts.append(app_name)
+            if title:
+                parts.append(title)
+            self._app_info = ' — '.join(parts) if parts else ''
+            self._last_fg_exe = exe
+            self._last_fg_title = title
+        else:
+            self._app_info = ''
+            self._last_fg_exe = ''
+            self._last_fg_title = ''
+
         self.update()
 
     def _toggle_panel(self):
-        self._panel_visible = not self._panel_visible
+        """Toggle the live typing panel.
+
+        אם סגרנו את תיבת ההקלדה בזמן שתיבת התרגום פתוחה,
+        נסגור גם את תיבת התרגום כדי שיישארו מסונכרנות.
+        """
+        new_visible = not self._panel_visible
+        # כשסוגרים פאנל (+ עורך) — שומרים ימין כדי שהעיגול יישאר באותו מקום
+        if not new_visible:
+            self._relayout_keep_right = self.x() + self.width()
+        self._panel_visible = new_visible
         self.tray.config['show_typing_panel'] = self._panel_visible
         save_config(self.tray.config)
+
+        if not new_visible and self._edit_mode:
+            self._edit_mode = False
+            self._hide_edit_window()
+
         self._relayout()
+
+    def _on_panel_lang_click(self, lang_code: str):
+        """Save app + title (at last update) with selected default language."""
+        self._panel_button_pressed_id = lang_code
+        self._panel_button_press_time = time.time()
+        QTimer.singleShot(350, self.update)
+        self.update()
+        try:
+            import auto_lang
+            exe = (getattr(self, '_last_fg_exe', '') or '').strip().lower()
+            title = (getattr(self, '_last_fg_title', '') or '').strip()
+            if not exe:
+                return
+            if not title:
+                self.tray.config.setdefault('app_defaults', {})[exe] = lang_code
+            else:
+                self.tray.config.setdefault('chat_defaults', {}).setdefault(exe, {})[title] = lang_code
+                watch = self.tray.config.get('watch_title_exes', [])
+                if exe not in watch:
+                    watch = list(watch) + [exe]
+                    self.tray.config['watch_title_exes'] = watch
+            save_config(self.tray.config)
+            auto_lang._load_ui_config()
+            self.update()
+        except Exception:
+            pass
+
+    def _on_panel_no_correction_click(self):
+        """Add app (at last update) to privacy_blocked_exes."""
+        self._panel_button_pressed_id = 'no_correction'
+        self._panel_button_press_time = time.time()
+        QTimer.singleShot(350, self.update)
+        self.update()
+        try:
+            import auto_lang
+            exe = (getattr(self, '_last_fg_exe', '') or '').strip().lower()
+            if not exe:
+                return
+            blocked = list(self.tray.config.get('privacy_blocked_exes', []))
+            if exe not in blocked:
+                blocked.append(exe)
+                self.tray.config['privacy_blocked_exes'] = blocked
+                save_config(self.tray.config)
+                auto_lang._load_ui_config()
+            self.update()
+        except Exception:
+            pass
 
     def _toggle_scores(self):
         self._hide_scores = not self._hide_scores
@@ -1541,8 +1722,12 @@ class FloatingWidget(QWidget):
         total_w = pw + sz
         total_h = sz + self._editor_height
 
-        # Keep right edge stable when toggling panel
-        old_right = self.x() + self.width()
+        # Keep right edge stable when toggling panel (or when closing panel+editor)
+        old_right = getattr(self, '_relayout_keep_right', None)
+        if old_right is None:
+            old_right = self.x() + self.width()
+        else:
+            self._relayout_keep_right = None
         self.setFixedSize(total_w, total_h)
         self.move(old_right - total_w, self.y())
 
@@ -1612,8 +1797,20 @@ class FloatingWidget(QWidget):
     # ── text editor ──────────────────────────────────────
 
     def _toggle_edit_mode(self):
+        """Open/close the translation editor.
+
+        אם פותחים את תיבת התרגום, נוודא שגם תיבת ההקלדה (הפאנל) פתוחה.
+        """
         self._edit_mode = not self._edit_mode
         if self._edit_mode:
+            # פתיחת תיבת התרגום → להבטיח שתיבת ההקלדה פתוחה
+            if not self._panel_visible:
+                self._panel_visible = True
+                if self.tray and getattr(self.tray, 'config', None) is not None:
+                    self.tray.config['show_typing_panel'] = True
+                    save_config(self.tray.config)
+                self._relayout()
+
             self._trans_visible = True
             self._show_edit_window()
         else:
@@ -1845,9 +2042,11 @@ class FloatingWidget(QWidget):
         self._toggle_trans_btn = None
 
         self._editor_height = 0
-        sz = self.WIDGET_SIZE
-        pw = self.PANEL_WIDTH if self._panel_visible else 0
-        self.setFixedSize(pw + sz, sz)
+        # Size/position left to caller's _relayout() so right edge is preserved when closing panel+editor
+        if getattr(self, '_relayout_keep_right', None) is None:
+            sz = self.WIDGET_SIZE
+            pw = self.PANEL_WIDTH if self._panel_visible else 0
+            self.setFixedSize(pw + sz, sz)
         self.update()
 
     def _on_boundary_typed(self):
@@ -2488,6 +2687,8 @@ class FloatingWidget(QWidget):
     # ── speech-to-text ───────────────────────────────────
 
     def _toggle_speech(self):
+        if not self.tray.config.get('speech_enabled', True):
+            return
         if self._speech_recording:
             self._stop_speech()
         else:
@@ -2794,19 +2995,39 @@ class SettingsWindow(QWidget):
         lbl.setAlignment(Qt.AlignRight)
         card_layout.addWidget(lbl)
 
-        desc = QLabel('\u05d4\u05d2\u05d3\u05e8 \u05e9\u05e4\u05ea \u05d1\u05e8\u05d9\u05e8\u05ea \u05de\u05d7\u05d3\u05dc \u05dc\u05e4\u05d9 \u05e9\u05dd \u05d4\u05ea\u05d4\u05dc\u05d9\u05da (exe). \u05d4\u05ea\u05d5\u05db\u05e0\u05d4 \u05ea\u05d7\u05dc\u05d9\u05e3 \u05d0\u05ea \u05d4\u05e9\u05e4\u05d4 \u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9\u05ea \u05db\u05e9\u05ea\u05e2\u05d1\u05d5\u05e8 \u05dc\u05d0\u05e4\u05dc\u05d9\u05e7\u05e6\u05d9\u05d4.')
+        desc = QLabel('\u05d4\u05d2\u05d3\u05e8 \u05e9\u05e4\u05ea \u05d1\u05e8\u05d9\u05e8\u05ea \u05de\u05d7\u05d3\u05dc \u05dc\u05e4\u05d9 \u05e9\u05dd \u05d4\u05ea\u05d4\u05dc\u05d9\u05da (exe). \u05d0\u05e4\u05dc\u05d9\u05e7\u05e6\u05d9\u05d5\u05ea \u05dc\u05dc\u05d0 \u05ea\u05d9\u05e7\u05d5\u05df \u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9 \u05de\u05d5\u05e4\u05d9\u05e2\u05d5\u05ea \u05d2\u05dd \u05d1\u05e8\u05e9\u05d9\u05de\u05d4 \u05d5\u05e0\u05d9\u05ea\u05df \u05dc\u05e2\u05e8\u05d5\u05da \u05d0\u05d5\u05ea\u05df.')
         desc.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt; background: transparent;")
         desc.setAlignment(Qt.AlignRight)
         desc.setWordWrap(True)
         card_layout.addWidget(desc)
 
-        self.app_table = self._make_table(2, ['\u05d0\u05e4\u05dc\u05d9\u05e7\u05e6\u05d9\u05d4 (exe)', '\u05e9\u05e4\u05d4'])
+        self.app_table = self._make_table(2, ['\u05d0\u05e4\u05dc\u05d9\u05e7\u05e6\u05d9\u05d4 (exe)', '\u05e9\u05e4\u05d4 / \u05dc\u05dc\u05d0 \u05ea\u05d9\u05e7\u05d5\u05df'])
         self.app_table.setColumnWidth(0, 350)
-        for app, lang in sorted(self.config.get('app_defaults', {}).items()):
+        app_defaults = self.config.get('app_defaults', {})
+        try:
+            import auto_lang
+            builtin_blocked = getattr(auto_lang, 'BUILTIN_PRIVACY_BLOCKED_EXE', set()) or set()
+        except Exception:
+            builtin_blocked = set()
+        config_blocked = set(e.lower() for e in self.config.get('privacy_blocked_exes', []) if e)
+        blocked_set = builtin_blocked | config_blocked
+        all_exes = sorted(set(app_defaults.keys()) | blocked_set)
+        app_combo_items = [_lang_display(c) for c in _get_available_lang_codes()] + [NO_CORRECTION_LABEL]
+        for exe in all_exes:
             row = self.app_table.rowCount()
             self.app_table.insertRow(row)
-            self.app_table.setItem(row, 0, QTableWidgetItem(app))
-            self.app_table.setItem(row, 1, QTableWidgetItem(_lang_display(lang)))
+            self.app_table.setItem(row, 0, QTableWidgetItem(exe))
+            is_blocked = exe.lower() in blocked_set
+            combo = QComboBox()
+            combo.addItems(app_combo_items)
+            if is_blocked:
+                combo.setCurrentText(NO_CORRECTION_LABEL)
+                if exe.lower() in builtin_blocked:
+                    combo.setEnabled(False)
+                combo.setStyleSheet(f'background-color: {COLORS["accent_dim"]}20;')
+            else:
+                combo.setCurrentText(_lang_display(app_defaults.get(exe, 'he')))
+            self.app_table.setCellWidget(row, 1, combo)
         card_layout.addWidget(self.app_table)
 
         # Add row
@@ -2819,9 +3040,9 @@ class SettingsWindow(QWidget):
         add_row.addWidget(self.app_exe_edit)
 
         self.app_lang_combo = QComboBox()
-        self.app_lang_combo.addItems(_get_available_lang_codes())
-        self.app_lang_combo.setCurrentText('he')
-        self.app_lang_combo.setFixedWidth(70)
+        self.app_lang_combo.addItems([_lang_display(c) for c in _get_available_lang_codes()] + [NO_CORRECTION_LABEL])
+        self.app_lang_combo.setCurrentText(_lang_display('he'))
+        self.app_lang_combo.setFixedWidth(100)
         add_row.addWidget(self.app_lang_combo)
 
         add_btn = QPushButton('\u2795 \u05d4\u05d5\u05e1\u05e3')
@@ -2838,19 +3059,27 @@ class SettingsWindow(QWidget):
 
     def _add_app(self):
         exe = self.app_exe_edit.text().strip()
-        lang = self.app_lang_combo.currentText()
+        val = self.app_lang_combo.currentText()
         if not exe:
             return
-        # Check if exists
+        exe_lower = exe.lower()
+        app_combo_items = [_lang_display(c) for c in _get_available_lang_codes()] + [NO_CORRECTION_LABEL]
         for row in range(self.app_table.rowCount()):
-            if self.app_table.item(row, 0).text() == exe:
-                self.app_table.setItem(row, 1, QTableWidgetItem(_lang_display(lang)))
+            if self.app_table.item(row, 0).text().lower() == exe_lower:
+                w = self.app_table.cellWidget(row, 1)
+                if w and isinstance(w, QComboBox):
+                    w.setCurrentText(val)
                 self.app_exe_edit.clear()
                 return
         row = self.app_table.rowCount()
         self.app_table.insertRow(row)
         self.app_table.setItem(row, 0, QTableWidgetItem(exe))
-        self.app_table.setItem(row, 1, QTableWidgetItem(_lang_display(lang)))
+        combo = QComboBox()
+        combo.addItems(app_combo_items)
+        combo.setCurrentText(val)
+        if val == NO_CORRECTION_LABEL:
+            combo.setStyleSheet(f'background-color: {COLORS["accent_dim"]}20;')
+        self.app_table.setCellWidget(row, 1, combo)
         self.app_exe_edit.clear()
 
     def _remove_app(self):
@@ -3500,6 +3729,37 @@ class SettingsWindow(QWidget):
 
         card2_layout.addStretch()
         layout.addWidget(card2)
+
+        # ── Speech-to-Text Section ──
+        sep3 = QFrame()
+        sep3.setFixedHeight(1)
+        sep3.setStyleSheet(f"background-color: {COLORS['border']}; border: none;")
+        layout.addWidget(sep3)
+
+        card3 = self._make_card()
+        card3_layout = QVBoxLayout(card3)
+        card3_layout.setContentsMargins(14, 12, 14, 12)
+
+        speech_lbl = QLabel('\U0001f3a4 \u05d4\u05e7\u05dc\u05d8\u05d4 \u05e7\u05d5\u05dc\u05d9\u05ea (Whisper)')
+        speech_lbl.setStyleSheet(f"color: {COLORS['accent']}; font-size: 14pt; font-weight: bold; background: transparent;")
+        speech_lbl.setAlignment(Qt.AlignRight)
+        card3_layout.addWidget(speech_lbl)
+
+        speech_desc = QLabel(
+            '\u05d4\u05de\u05e8\u05db\u05d6 \u05d4\u05e2\u05d9\u05d2\u05d5\u05dc \u05de\u05e4\u05e2\u05d9\u05dc \u05d4\u05e7\u05dc\u05d8\u05d4 \u05e7\u05d5\u05dc\u05d9\u05ea \u05de\u05de\u05d9\u05e7\u05e8\u05d5\u05e4\u05d5\u05df \u05de\u05e7\u05dc\u05d9\u05d3\u05d4.\n'
+            '\u05db\u05e9\u05d6\u05d4 \u05db\u05d1\u05d5\u05d9, \u05d4\u05ea\u05de\u05d5\u05d3\u05dc \u05e9\u05dc Whisper \u05dc\u05d0 \u05de\u05d5\u05e2\u05dc\u05d4 \u05d1\u05e8\u05e7\u05d2\u05e8\u05d0\u05e0\u05d3 \u05e8\u05e6\u05d9\u05e0\u05d4.'
+        )
+        speech_desc.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 9pt; background: transparent;")
+        speech_desc.setAlignment(Qt.AlignRight)
+        speech_desc.setWordWrap(True)
+        card3_layout.addWidget(speech_desc)
+
+        self.speech_enabled_cb = QCheckBox('\u05d4\u05e7\u05dc\u05d8\u05d4 \u05e7\u05d5\u05dc\u05d9\u05ea \u05e4\u05e2\u05d9\u05dc')
+        self.speech_enabled_cb.setChecked(self.config.get('speech_enabled', True))
+        self.speech_enabled_cb.setLayoutDirection(Qt.RightToLeft)
+        card3_layout.addWidget(self.speech_enabled_cb)
+
+        layout.addWidget(card3)
         layout.addStretch()
 
     def _on_grammar_provider_changed(self, index):
@@ -3587,12 +3847,24 @@ class SettingsWindow(QWidget):
     # ─── Save ────────────────────────────────────────────
 
     def _save(self):
-        # App defaults
+        # App defaults + privacy_blocked_exes (no automatic correction)
+        try:
+            import auto_lang
+            builtin_blocked = getattr(auto_lang, 'BUILTIN_PRIVACY_BLOCKED_EXE', set()) or set()
+        except Exception:
+            builtin_blocked = set()
         app_defaults = {}
+        no_correction_exes = []
         for row in range(self.app_table.rowCount()):
             app = self.app_table.item(row, 0).text()
-            lang = _lang_code_from_display(self.app_table.item(row, 1).text())
-            app_defaults[app] = lang
+            w = self.app_table.cellWidget(row, 1)
+            val = w.currentText() if (w and isinstance(w, QComboBox)) else (self.app_table.item(row, 1).text() if self.app_table.item(row, 1) else '')
+            if val == NO_CORRECTION_LABEL:
+                no_correction_exes.append(app)
+            else:
+                app_defaults[app] = _lang_code_from_display(val)
+        # Save only user-added blocked exes (builtin are always in engine)
+        privacy_blocked_exes = [e for e in no_correction_exes if e.lower() not in builtin_blocked]
 
         # Chat defaults
         chat_defaults = {}
@@ -3615,6 +3887,7 @@ class SettingsWindow(QWidget):
         exclude_words = [self.exclude_list.item(i).text() for i in range(self.exclude_list.count())]
 
         self.config['app_defaults'] = app_defaults
+        self.config['privacy_blocked_exes'] = privacy_blocked_exes
         self.config['chat_defaults'] = chat_defaults
         self.config['browser_defaults'] = browser_defaults
         self.config['exclude_words'] = exclude_words
@@ -3632,7 +3905,7 @@ class SettingsWindow(QWidget):
         self.config['show_typing_panel'] = self.show_panel_cb.isChecked()
         self.config['privacy_guard'] = self.privacy_guard_cb.isChecked()
 
-        # Spell & Grammar
+        # Spell, Grammar & Speech
         self.config['spell_enabled'] = self.spell_enabled_cb.isChecked()
         mode_map_rev = {0: 'tooltip', 1: 'auto', 2: 'visual'}
         self.config['spell_mode'] = mode_map_rev.get(self.spell_mode_combo.currentIndex(), 'tooltip')
@@ -3643,6 +3916,7 @@ class SettingsWindow(QWidget):
         self.config['grammar_provider'] = provider_keys[p_idx] if 0 <= p_idx < len(provider_keys) else 'openai'
         self.config['grammar_api_key'] = self.grammar_api_key_edit.text().strip()
         self.config['grammar_model'] = self.grammar_model_combo.currentText().strip()
+        self.config['speech_enabled'] = getattr(self, 'speech_enabled_cb', None).isChecked() if hasattr(self, 'speech_enabled_cb') else self.config.get('speech_enabled', True)
 
         save_config(self.config)
         self.status_label.setText('\u2705 \u05d4\u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05e0\u05e9\u05de\u05e8\u05d5 \u05d1\u05d4\u05e6\u05dc\u05d7\u05d4!')
@@ -3742,10 +4016,11 @@ class AutoLangTray:
         engine.AUTO_SWITCH_LAYOUT = cfg.get('auto_switch', True)
         engine.AUTO_SWITCH_AFTER_CONSECUTIVE = cfg.get('auto_switch_count', 2)
 
-        # Privacy Guard
+        # Privacy Guard (merge builtin + user list)
         engine.PRIVACY_GUARD_ENABLED = cfg.get('privacy_guard', True)
         blocked = cfg.get('privacy_blocked_exes', [])
-        engine.PRIVACY_BLOCKED_EXE = set(e.lower() for e in blocked)
+        builtin = getattr(engine, 'BUILTIN_PRIVACY_BLOCKED_EXE', set()) or set()
+        engine.PRIVACY_BLOCKED_EXE = builtin | set(e.lower() for e in blocked if e)
 
         # Spell check
         try:
