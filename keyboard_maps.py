@@ -76,11 +76,8 @@ HE_WORD_TO_EN: Dict[str, str] = {
 }
 
 # English key sequences that mean a Hebrew word (wrong layout) -> correct Hebrew.
-EN_WORD_TO_HE: Dict[str, str] = {
-    'vrcv': 'הרבה',
-    'hu,r': 'הרבה',
-    'hfr': 'הרבה',
-}
+# Leave empty to use key mapping only (e.g. hu,r -> יותר).
+EN_WORD_TO_HE: Dict[str, str] = {}
 
 _HE_SHORT_WORDS = {
     # Common 1-2 letter Hebrew words typed with English layout

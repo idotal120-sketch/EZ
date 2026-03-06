@@ -987,13 +987,13 @@ class FloatingWidget(QWidget):
         rects = []
 
         if not words1 and self._app_info:
-            # Label "בחר:" on the right, then buttons RTL
+            # Label "בחר:" — colon visually to the left (put colon first in string)
             btn_y, btn_h = 26, 18
             pad = 4
             font_btn = QFont('Segoe UI', 8)
             p.setFont(font_btn)
             fm_btn = QFontMetrics(font_btn)
-            set_as_label = '\u05d1\u05d7\u05e8\u200f:'  # בחר + RLM + :
+            set_as_label = ':\u05d1\u05d7\u05e8'  # : + בחר so colon draws left of word
             label_w = fm_btn.horizontalAdvance(set_as_label)
             gap_after_label = 8
             x_right = pw - margin - label_w - gap_after_label
